@@ -1,0 +1,29 @@
+# ── Dependencies ─────────────────────────────────────────────────────────────
+node_modules/
+
+# ── Environment / Secrets — NEVER COMMIT THESE ───────────────────────────────
+.env
+.env.local
+.env.*.local
+*.env
+
+# ── Build outputs ─────────────────────────────────────────────────────────────
+dist/
+.next/
+out/
+build/
+
+# ── TypeScript ────────────────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ── Vercel ────────────────────────────────────────────────────────────────────
+.vercel
+
+# ── OS / Editor ───────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.vscode/settings.json
+
+# ── Playwright ────────────────────────────────────────────────────────────────
+test-results/
+playwright-report/
