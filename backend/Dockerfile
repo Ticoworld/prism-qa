@@ -1,5 +1,5 @@
 # ── Stage 1: Build (compile TypeScript) ──────────────────────────────────────
-FROM mcr.microsoft.com/playwright:v1.50.1-noble AS builder
+FROM mcr.microsoft.com/playwright:v1.58.2-noble AS builder
 
 WORKDIR /app
 
@@ -13,7 +13,7 @@ RUN npx tsc --project tsconfig.json
 # ── Stage 2: Runtime ─────────────────────────────────────────────────────────
 # Playwright base image already has Chromium + all OS-level deps installed.
 # No need to run playwright install again.
-FROM mcr.microsoft.com/playwright:v1.50.1-noble
+FROM mcr.microsoft.com/playwright:v1.58.2-noble
 
 WORKDIR /app
 

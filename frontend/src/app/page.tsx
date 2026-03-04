@@ -653,7 +653,7 @@ export default function PrismQA() {
         <span style={{ color: "var(--wire-3)" }}>|</span>
         <span>PLAYWRIGHT/CHROMIUM</span>
         <span style={{ color: "var(--wire-3)" }}>|</span>
-        <span>WS ws://localhost:3001/ws</span>
+        <span style={{ color: "var(--fg-2)" }}>WS {sessionUrl ?? "wss://prism-qa-backend-959993808456.us-central1.run.app/ws"}</span>
         <div style={{ flex: 1 }} />
         <span style={{ color: connectionState === "connected" ? "var(--G)" : "var(--R)" }}>
           {connectionState.toUpperCase()}
