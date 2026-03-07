@@ -6,6 +6,7 @@ import {
   chromium,
   type Browser,
   type BrowserContext,
+  type Frame,
   type Page,
 } from "playwright";
 import { analyzeMarkedScreenshot, type GeminiVerdict } from "./agent";
@@ -30,6 +31,8 @@ interface ActionClickMessage {
   action: "click";
   x: number;
   y: number;
+  /** Badge ID that was clicked (for session history so the agent does not repeat). */
+  target_id?: number;
 }
 
 interface ActionTypeMessage {
@@ -37,10 +40,12 @@ interface ActionTypeMessage {
   action: "type";
   /** Exact string to type */
   text: string;
-  /** Center X of the target element — used to click-focus before typing */
+  /** Center X of the target element — used when target_id not resolved */
   x: number;
-  /** Center Y of the target element — used to click-focus before typing */
+  /** Center Y of the target element — used when target_id not resolved */
   y: number;
+  /** Badge ID for re-resolving current center at action time (avoids stale coords) */
+  target_id?: number;
 }
 
 interface ActionNavigateMessage {
@@ -56,6 +61,8 @@ interface ActionScrollMessage {
   y: number;
   deltaX?: number;
   deltaY?: number;
+  /** When set, scroll by one viewport height (used by agent SCROLL action). */
+  direction?: "up" | "down";
 }
 
 interface InitMessage {
@@ -111,6 +118,8 @@ interface WireQaAction {
   x_coordinate: number; // resolved from ElementMark.centerX
   y_coordinate: number; // resolved from ElementMark.centerY
   target_id: number; // the badge ID Gemini selected
+  /** When action_type is "scroll", "up" or "down". */
+  scroll_direction?: "up" | "down";
   input_text: string;
   is_error_state: boolean;
   task_status: "in_progress" | "completed" | "failed";
@@ -192,6 +201,8 @@ async function createSession(): Promise<Session> {
       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
   });
   const page = await context.newPage();
+  // Block web fonts to prevent screenshot hangs and reduce bandwidth
+  await page.route("**/*.{woff,woff2,ttf,otf,eot}", (route) => route.abort());
   return { context, page };
 }
 
@@ -208,7 +219,7 @@ async function destroySession(session: Session): Promise<void> {
 // Set-of-Mark helpers
 // ---------------------------------------------------------------------------
 
-/** One interactive element found on the page */
+/** One interactive element found on the page (main-viewport coordinates) */
 interface ElementMark {
   id: number;
   centerX: number;
@@ -216,63 +227,60 @@ interface ElementMark {
   tag: string;
 }
 
-/**
- * Inject visual bounding boxes + numbered red badges into the live page.
- * Returns the element map so the backend can resolve badge IDs → coordinates.
- * All injected DOM nodes carry data-prism-* attributes for easy cleanup.
- */
-async function injectMarks(page: Page): Promise<ElementMark[]> {
-  return page.evaluate(
-    (): { id: number; centerX: number; centerY: number; tag: string }[] => {
-      const SELECTORS = [
-        "input",
-        "button",
-        "a",
-        "select",
-        "textarea",
-        '[role="button"]',
-        '[role="link"]',
-        '[role="option"]',
-        '[role="menuitem"]',
-        '[role="menuitemcheckbox"]',
-        '[role="menuitemradio"]',
-        '[role="listitem"]',
-        '[role="combobox"]',
-        '[role="tab"]',
-        '[tabindex]:not([tabindex="-1"])',
-      ].join(", ");
-      const elements = Array.from(
-        document.querySelectorAll<HTMLElement>(SELECTORS),
-      );
-      const marks: {
-        id: number;
-        centerX: number;
-        centerY: number;
-        tag: string;
-      }[] = [];
-      let id = 1;
+const SOM_SELECTORS = [
+  "input",
+  "button",
+  "a",
+  "select",
+  "textarea",
+  '[role="button"]',
+  '[role="link"]',
+  '[role="option"]',
+  '[role="menuitem"]',
+  '[role="menuitemcheckbox"]',
+  '[role="menuitemradio"]',
+  '[role="listitem"]',
+  '[role="combobox"]',
+  '[role="tab"]',
+  '[tabindex]:not([tabindex="-1"])',
+].join(", ");
 
+/** Max frames to inject SoM into; ad-heavy pages (e.g. W3Schools) can have 200+ iframes. */
+const MAX_FRAMES_FOR_SOM = 20;
+
+/** Collect frames in deterministic order: main first, then children depth-first. */
+function collectFrames(page: Page): Frame[] {
+  const out: Frame[] = [];
+  function walk(frame: Frame): void {
+    out.push(frame);
+    for (const child of frame.childFrames()) walk(child);
+  }
+  walk(page.mainFrame());
+  return out.slice(0, MAX_FRAMES_FOR_SOM);
+}
+
+/** Per-frame injection: run inside a single frame. Returns marks (frame-relative coords) and nextId. */
+async function injectMarksInFrame(
+  frame: Frame,
+  startId: number,
+): Promise<{ marks: { id: number; centerX: number; centerY: number; tag: string }[]; nextId: number }> {
+  return frame.evaluate(
+    (arg: { sel: string; sid: number }) => {
+      const { sel, sid } = arg;
+      const elements = Array.from(document.querySelectorAll<HTMLElement>(sel));
+      const marks: { id: number; centerX: number; centerY: number; tag: string }[] = [];
+      let id = sid;
       for (const el of elements) {
         const rect = el.getBoundingClientRect();
         if (rect.width === 0 || rect.height === 0) continue;
-
         const cs = window.getComputedStyle(el);
-        if (
-          cs.display === "none" ||
-          cs.visibility === "hidden" ||
-          parseFloat(cs.opacity) === 0
-        )
+        if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
           continue;
-
-        // Mark the element itself — use setProperty with !important so the
-        // outline punches through React portal z-stacking contexts.
         el.setAttribute("data-prism-id", String(id));
         el.style.setProperty("outline", "2px solid #ff0000", "important");
         el.style.setProperty("outline-offset", "1px", "important");
-        el.style.setProperty("position", "relative", "important"); // establish stacking context
-        el.style.setProperty("z-index", "999998", "important"); // sit below only our badge
-
-        // Create the numeric badge
+        el.style.setProperty("position", "relative", "important");
+        el.style.setProperty("z-index", "999998", "important");
         const badge = document.createElement("div");
         badge.setAttribute("data-prism-badge", "true");
         badge.style.cssText = [
@@ -292,7 +300,6 @@ async function injectMarks(page: Page): Promise<ElementMark[]> {
         ].join(";");
         badge.textContent = String(id);
         document.body.appendChild(badge);
-
         marks.push({
           id,
           centerX: Math.round(rect.left + rect.width / 2),
@@ -301,20 +308,167 @@ async function injectMarks(page: Page): Promise<ElementMark[]> {
         });
         id++;
       }
-      return marks;
+      return { marks, nextId: id };
     },
+    { sel: SOM_SELECTORS, sid: startId },
   );
 }
 
 /**
- * Remove all injected SoM overlays from the page so the next clean
- * screenshot has no visual artifacts.
+ * Inject visual bounding boxes + numbered red badges into the main page and all
+ * same-origin iframes. Badge IDs are globally unique. Returns element map with
+ * coordinates in main-page viewport (iframe elements offset by iframe rect).
  */
-async function cleanupMarks(page: Page): Promise<void> {
-  await page.evaluate(() => {
-    document
-      .querySelectorAll("[data-prism-badge]")
-      .forEach((el) => el.remove());
+/**
+ * Inject SoM into main frame and all same-origin iframes.
+ * Cross-origin iframes are skipped (browser security); only same-origin embeds get badges.
+ */
+async function injectMarks(page: Page): Promise<ElementMark[]> {
+  const frames = collectFrames(page);
+  let globalBadgeCounter = 1;
+  const elementMap: ElementMark[] = [];
+  let framesInjected = 0;
+
+  for (const frame of frames) {
+    let offsetX = 0;
+    let offsetY = 0;
+    if (frame !== page.mainFrame()) {
+      try {
+        const frameEl = await frame.frameElement();
+        if (frameEl) {
+          const box = await frameEl.boundingBox();
+          if (box) {
+            offsetX = box.x;
+            offsetY = box.y;
+          }
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    try {
+      const { marks, nextId } = await injectMarksInFrame(frame, globalBadgeCounter);
+      for (const m of marks) {
+        elementMap.push({
+          id: m.id,
+          centerX: offsetX + m.centerX,
+          centerY: offsetY + m.centerY,
+          tag: m.tag,
+        });
+      }
+      globalBadgeCounter = nextId;
+      framesInjected++;
+    } catch {
+      // Cross-origin or inaccessible frame — skip (cannot inject into it)
+    }
+  }
+
+  if (framesInjected > 1) {
+    console.log(`[som] Injected marks into ${framesInjected} frames (main + iframes).`);
+  }
+  return elementMap;
+}
+
+/** Per-frame: count visible interactive elements (same logic as inject). */
+async function countElementsInFrame(frame: Frame): Promise<number> {
+  return frame.evaluate((sel: string) => {
+    const elements = Array.from(document.querySelectorAll<HTMLElement>(sel));
+    let count = 0;
+    for (const el of elements) {
+      const rect = el.getBoundingClientRect();
+      if (rect.width === 0 || rect.height === 0) continue;
+      const cs = window.getComputedStyle(el);
+      if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
+        continue;
+      count++;
+    }
+    return count;
+  }, SOM_SELECTORS);
+}
+
+/** Per-frame: return current center of the Nth visible element (1-based). */
+async function getCenterOfNthInFrame(
+  frame: Frame,
+  localIndex: number,
+): Promise<{ x: number; y: number } | null> {
+  return frame.evaluate(
+    (arg: { sel: string; idx: number }): { x: number; y: number } | null => {
+      const { sel, idx } = arg;
+      const elements = Array.from(document.querySelectorAll<HTMLElement>(sel));
+      let count = 0;
+      for (const el of elements) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+        const cs = window.getComputedStyle(el);
+        if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
+          continue;
+        count++;
+        if (count === idx) {
+          return {
+            x: Math.round(rect.left + rect.width / 2),
+            y: Math.round(rect.top + rect.height / 2),
+          };
+        }
+      }
+      return null;
+    },
+    { sel: SOM_SELECTORS, idx: localIndex },
+  );
+}
+
+/**
+ * Resolve badge ID to the element's current center in main-viewport coordinates,
+ * searching the main page and all same-origin iframes. Use at action time to
+ * avoid layout shift / stale coordinates.
+ */
+async function getCenterByBadgeId(
+  page: Page,
+  badgeId: number,
+): Promise<{ x: number; y: number } | null> {
+  if (badgeId < 1) return null;
+  const frames = collectFrames(page);
+  let cumulative = 0;
+  for (const frame of frames) {
+    let count: number;
+    try {
+      count = await countElementsInFrame(frame);
+    } catch {
+      continue;
+    }
+    const frameStart = cumulative + 1;
+    const frameEnd = cumulative + count;
+    if (badgeId >= frameStart && badgeId <= frameEnd) {
+      const localIndex = badgeId - frameStart + 1;
+      let offsetX = 0;
+      let offsetY = 0;
+      if (frame !== page.mainFrame()) {
+        try {
+          const frameEl = await frame.frameElement();
+          if (frameEl) {
+            const box = await frameEl.boundingBox();
+            if (box) {
+              offsetX = box.x;
+              offsetY = box.y;
+            }
+          }
+        } catch {
+          return null;
+        }
+      }
+      const center = await getCenterOfNthInFrame(frame, localIndex);
+      if (!center) return null;
+      return { x: offsetX + center.x, y: offsetY + center.y };
+    }
+    cumulative = frameEnd;
+  }
+  return null;
+}
+
+/** Run cleanup in a single frame (removes badges and data-prism-id). */
+async function cleanupMarksInFrame(frame: Frame): Promise<void> {
+  await frame.evaluate(() => {
+    document.querySelectorAll("[data-prism-badge]").forEach((el) => el.remove());
     document.querySelectorAll<HTMLElement>("[data-prism-id]").forEach((el) => {
       el.style.removeProperty("outline");
       el.style.removeProperty("outline-offset");
@@ -325,6 +479,21 @@ async function cleanupMarks(page: Page): Promise<void> {
   });
 }
 
+/**
+ * Remove all injected SoM overlays from the main page and every accessible
+ * frame so the next clean screenshot has no visual artifacts.
+ */
+async function cleanupMarks(page: Page): Promise<void> {
+  const frames = collectFrames(page);
+  for (const frame of frames) {
+    try {
+      await cleanupMarksInFrame(frame);
+    } catch {
+      // Cross-origin or inaccessible frame — skip
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Action handlers
 // ---------------------------------------------------------------------------
@@ -333,8 +502,12 @@ async function handleCapture(
   socket: WebSocket,
 ): Promise<void> {
   const buffer = await session.page.screenshot({
-    type: "png",
+    type: "jpeg",
+    quality: 50,
+    scale: "css",
     fullPage: false,
+    animations: "disabled",
+    timeout: 10_000,
   });
   send(socket, {
     type: "capture_result",
@@ -342,6 +515,29 @@ async function handleCapture(
     url: session.page.url(),
     timestamp: Date.now(),
   });
+}
+
+/**
+ * After a click or type+Enter that might trigger navigation: wait for that
+ * navigation to finish, or a short timeout if no navigation. Prevents
+ * "Execution context was destroyed" when the next cycle runs evaluate/screenshot.
+ */
+async function waitForNavigationIfAny(page: Page): Promise<void> {
+  await Promise.race([
+    page.waitForNavigation({ waitUntil: "load", timeout: 15_000 }),
+    page.waitForTimeout(2_500),
+  ]).catch(() => {});
+}
+
+/**
+ * True if this verdict is the same click as the last executed action in history
+ * (so we would be repeating a failed action and must intercept).
+ */
+function isDuplicateAction(verdict: GeminiVerdict, history: string[]): boolean {
+  if (verdict.action_type !== "click" || verdict.target_id < 1) return false;
+  const last = history[history.length - 1];
+  if (typeof last !== "string") return false;
+  return last.includes(`Clicked badge ${verdict.target_id}`);
 }
 
 /**
@@ -362,18 +558,25 @@ async function handleAnalyze(
 ): Promise<void> {
   console.log(`[som] Injecting marks for: "${msg.objective}"`);
 
+  await session.page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
+
   // ── Step 1: inject visual anchors ──────────────────────────────────────
-  const elementMap = await injectMarks(session.page);
+  let elementMap = await injectMarks(session.page);
   console.log(`[som] ${elementMap.length} interactive elements marked.`);
 
   // ── Step 2: screenshot WITH marks visible ──────────────────────────────
-  const buffer = await session.page.screenshot({
-    type: "png",
+  let buffer = await session.page.screenshot({
+    type: "jpeg",
+    quality: 50,
+    scale: "css",
     fullPage: false,
+    animations: "disabled",
+    timeout: 10_000,
   });
-  const imageBase64 = buffer.toString("base64");
+  let imageBase64 = buffer.toString("base64");
+  console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
 
-  // ── Step 3: ask Gemini to identify the badge ID ────────────────────────
+  // ── Step 3: ask Gemini; loop if it returns SCROLL ──────────────────────
   let verdict: GeminiVerdict;
   try {
     verdict = await analyzeMarkedScreenshot({
@@ -381,8 +584,115 @@ async function handleAnalyze(
       objective: msg.objective,
       history,
     });
+
+    // SCROLL loop: execute scroll, re-inject, re-screenshot, re-ask Gemini until non-scroll
+    while (verdict.action_type === "scroll") {
+      const dir = verdict.scroll_direction ?? "down";
+      console.log(`[som] Gemini requested SCROLL ${dir}; executing then re-analyzing.`);
+      await cleanupMarks(session.page);
+
+      const beforeScroll = await session.page.evaluate(() => window.scrollY);
+      await session.page.evaluate(
+        (d: string) =>
+          window.scrollBy(
+            0,
+            d === "down" ? window.innerHeight : -window.innerHeight,
+          ),
+        dir,
+      );
+      await session.page
+        .waitForLoadState("networkidle", { timeout: 5_000 })
+        .catch(() => {});
+      const afterScroll = await session.page.evaluate(() => window.scrollY);
+
+      if (beforeScroll === afterScroll) {
+        history.push(
+          `Scroll failed. Reached the ${dir === "down" ? "bottom" : "top"} of the page.`,
+        );
+      } else {
+        history.push(`Scrolled page ${dir}`);
+      }
+
+      await session.page.waitForTimeout(1_000);
+
+      elementMap = await injectMarks(session.page);
+      buffer = await session.page.screenshot({
+        type: "jpeg",
+        quality: 50,
+        scale: "css",
+        fullPage: false,
+        animations: "disabled",
+        timeout: 10_000,
+      });
+      imageBase64 = buffer.toString("base64");
+      console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
+      verdict = await analyzeMarkedScreenshot({
+        imageBase64,
+        objective: msg.objective,
+        history,
+      });
+    }
+
+    // Duplicate-action interceptor: if Gemini returns the same click as the last executed action, do not send it; push warning and re-analyze
+    const DUPLICATE_LOOP_MAX = 3;
+    let duplicateCount = 0;
+    while (duplicateCount < DUPLICATE_LOOP_MAX && isDuplicateAction(verdict, history)) {
+      console.log(
+        `[som] Duplicate action detected (click badge ${verdict.target_id}); injecting system warning and re-analyzing.`,
+      );
+      history.push(
+        "[SYSTEM WARNING: You just attempted to execute the exact same action twice in a row. The UI did not change. You are in an infinite loop. You MUST select a different target or SCROLL.]",
+      );
+      duplicateCount++;
+      await cleanupMarks(session.page);
+      elementMap = await injectMarks(session.page);
+      buffer = await session.page.screenshot({
+        type: "jpeg",
+        quality: 50,
+        scale: "css",
+        fullPage: false,
+        animations: "disabled",
+        timeout: 10_000,
+      });
+      imageBase64 = buffer.toString("base64");
+      console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
+      verdict = await analyzeMarkedScreenshot({
+        imageBase64,
+        objective: msg.objective,
+        history,
+      });
+    }
+
+    const MALFORMED_JSON_MARKER = "System Error: You returned malformed JSON.";
+    const MALFORMED_JSON_RETRY_MAX = 2;
+    let malformedRetries = 0;
+    while (
+      malformedRetries < MALFORMED_JSON_RETRY_MAX &&
+      verdict.is_error_state &&
+      verdict.reasoning.includes(MALFORMED_JSON_MARKER)
+    ) {
+      console.log(`[som] Malformed JSON from Gemini; pushing to history and retrying (${malformedRetries + 1}/${MALFORMED_JSON_RETRY_MAX}).`);
+      history.push(verdict.reasoning);
+      malformedRetries++;
+      await cleanupMarks(session.page);
+      elementMap = await injectMarks(session.page);
+      buffer = await session.page.screenshot({
+        type: "jpeg",
+        quality: 50,
+        scale: "css",
+        fullPage: false,
+        animations: "disabled",
+        timeout: 10_000,
+      });
+      imageBase64 = buffer.toString("base64");
+      console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
+      verdict = await analyzeMarkedScreenshot({
+        imageBase64,
+        objective: msg.objective,
+        history,
+      });
+    }
   } finally {
-    // ── Step 6: always clean up, even on error ────────────────────────────
     await cleanupMarks(session.page);
   }
 
@@ -414,6 +724,9 @@ async function handleAnalyze(
     x_coordinate: resolvedX,
     y_coordinate: resolvedY,
     target_id: verdict.target_id,
+    ...(verdict.action_type === "scroll" && verdict.scroll_direction
+      ? { scroll_direction: verdict.scroll_direction }
+      : {}),
     input_text: verdict.input_text,
     is_error_state: verdict.is_error_state,
     task_status: verdict.task_status,
@@ -437,32 +750,93 @@ async function handleAction(
 
   switch (msg.action) {
     case "click": {
-      await session.page.mouse.click(msg.x, msg.y);
+      const clickCoords =
+        msg.target_id != null && msg.target_id >= 1
+          ? await getCenterByBadgeId(session.page, msg.target_id)
+          : null;
+      const cx = clickCoords?.x ?? msg.x;
+      const cy = clickCoords?.y ?? msg.y;
+      if (clickCoords == null && msg.target_id != null && msg.target_id >= 1) {
+        console.warn(
+          `[som] Could not re-resolve badge ${msg.target_id} at click time; using stored coords (${msg.x}, ${msg.y}).`,
+        );
+      }
+      // Race: in-page navigation vs new tab. Whichever happens first wins. Prefer in-page
+      // so flows that navigate the main page are unchanged; only switch when a new tab
+      // opens and the current page did not navigate (e.g. W3Schools "Try it Yourself").
+      const context = session.page.context();
+      const navPromise = session.page
+        .waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5_000 })
+        .then(() => ({ kind: "nav" as const }));
+      const popupPromise = context
+        .waitForEvent("page", { timeout: 5_000 })
+        .then((p) => ({ kind: "popup" as const, page: p }));
+      await session.page.mouse.click(cx, cy);
+      const winner = await Promise.race([navPromise, popupPromise]).catch(() => null);
+      if (winner?.kind === "popup") {
+        console.log(`[ws] Click opened new tab; switching session to it.`);
+        await winner.page.waitForLoadState("domcontentloaded", { timeout: 15_000 }).catch(() => {});
+        const oldPage = session.page;
+        session.page = winner.page;
+        await oldPage.close().catch(() => {});
+      } else if (winner?.kind === "nav") {
+        // In-page navigation won; session already on the same page (now loaded)
+      } else {
+        await waitForNavigationIfAny(session.page);
+      }
       break;
     }
     case "type": {
-      // Step 1: click the element to guarantee focus before typing.
-      await session.page.mouse.click(msg.x, msg.y);
-      // Step 2: brief pause for React/Vue controlled inputs to register the click.
+      const typeCoords =
+        msg.target_id != null && msg.target_id >= 1
+          ? await getCenterByBadgeId(session.page, msg.target_id)
+          : null;
+      const tx = typeCoords?.x ?? msg.x;
+      const ty = typeCoords?.y ?? msg.y;
+      if (typeCoords == null && msg.target_id != null && msg.target_id >= 1) {
+        console.warn(
+          `[som] Could not re-resolve badge ${msg.target_id} at type time; using stored coords (${msg.x}, ${msg.y}).`,
+        );
+      }
+      await session.page.mouse.click(tx, ty);
       await session.page.waitForTimeout(80);
-      // Step 3: type the text (for native <select>, this filters option text).
       await session.page.keyboard.type(msg.text);
-      // Step 4: press Enter to lock in the selection (critical for native dropdowns).
       await session.page.keyboard.press("Enter");
+      await waitForNavigationIfAny(session.page);
       break;
     }
     case "navigate": {
-      await session.page.goto(msg.url, {
-        waitUntil: "networkidle",
-        timeout: 30_000,
-      });
+      try {
+        await session.page.goto(msg.url, {
+          waitUntil: "domcontentloaded",
+          timeout: 45_000,
+        });
+      } catch (navErr) {
+        const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
+        if (!errMsg.includes("Timeout") && !errMsg.includes("timeout")) throw navErr;
+      }
       break;
     }
     case "scroll": {
-      await session.page.mouse.wheel(msg.deltaX ?? 0, msg.deltaY ?? 0);
+      if (msg.direction === "up" || msg.direction === "down") {
+        await session.page.evaluate(
+          (dir: string) =>
+            window.scrollBy(
+              0,
+              dir === "down" ? window.innerHeight : -window.innerHeight,
+            ),
+          msg.direction,
+        );
+      } else {
+        await session.page.mouse.wheel(msg.deltaX ?? 0, msg.deltaY ?? 0);
+      }
       break;
     }
   }
+
+  // Give the page (and any iframes, e.g. result pane after "Run") time to update before next analyze.
+  const postActionDelay = msg.action === "click" ? 2_500 : 1_000;
+  await session.page.waitForTimeout(postActionDelay);
 
   send(socket, {
     type: "action_ack",
@@ -503,6 +877,16 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
 wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
   const clientIp = req.socket.remoteAddress ?? "unknown";
+
+  // ── Token handshake: reject before provisioning any Playwright session ──
+  const url = new URL(req.url ?? "/ws", "http://localhost");
+  const token = url.searchParams.get("token");
+  const secret = process.env["WS_SECRET_TOKEN"];
+  if (!secret || token !== secret) {
+    console.warn(`[ws] Unauthorized connection from ${clientIp} (missing or invalid token).`);
+    socket.close(1008, "Unauthorized");
+    return;
+  }
   console.log(`[ws] Client connected from ${clientIp}`);
 
   // Per-connection state
@@ -554,12 +938,23 @@ wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
     try {
       if (msg.type === "init") {
         // Navigate the browser to the user-supplied URL, then confirm ready.
+        // Use domcontentloaded so sticky headers/ads don't block; heavy sites often never "load".
         const targetUrl = msg.url.trim();
         console.log(`[ws] Received init. Navigating to ${targetUrl}...`);
-        await session.page.goto(targetUrl, {
-          waitUntil: "networkidle",
-          timeout: 30_000,
-        });
+        try {
+          await session.page.goto(targetUrl, {
+            waitUntil: "domcontentloaded",
+            timeout: 45_000,
+          });
+        } catch (navErr) {
+          const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
+          if (errMsg.includes("Timeout") || errMsg.includes("timeout")) {
+            console.warn(`[ws] Navigation timeout; proceeding with current document.`);
+          } else {
+            throw navErr;
+          }
+        }
+        await session.page.waitForTimeout(2_000);
         const live = session.page.url();
         console.log(`[ws] Session ready at ${live}`);
         send(socket, {
@@ -572,7 +967,11 @@ wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
       } else if (msg.type === "action") {
         // Record action in session memory before executing
         if (msg.action === "click") {
-          sessionHistory.push(`Clicked at coordinates (${msg.x}, ${msg.y})`);
+          const badge =
+            msg.target_id != null
+              ? `Clicked badge ${msg.target_id} at (${msg.x}, ${msg.y})`
+              : `Clicked at coordinates (${msg.x}, ${msg.y})`;
+          sessionHistory.push(badge);
         } else if (msg.action === "type") {
           sessionHistory.push(
             `Typed "${msg.text}" into element at (${msg.x}, ${msg.y}) [target focused first]`,
@@ -580,9 +979,11 @@ wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
         } else if (msg.action === "navigate") {
           sessionHistory.push(`Navigated to ${msg.url}`);
         } else if (msg.action === "scroll") {
-          sessionHistory.push(
-            `Scrolled page (deltaX: ${msg.deltaX ?? 0}, deltaY: ${msg.deltaY ?? 0})`,
-          );
+          const desc =
+            msg.direction != null
+              ? `Scrolled page ${msg.direction}`
+              : `Scrolled page (deltaX: ${msg.deltaX ?? 0}, deltaY: ${msg.deltaY ?? 0})`;
+          sessionHistory.push(desc);
         }
         await handleAction(msg, session, socket);
       } else if (msg.type === "analyze") {

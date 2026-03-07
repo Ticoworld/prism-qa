@@ -123,7 +123,8 @@ function LogRow({ entry }: { entry: LogEntry }) {
 export default function PrismQA() {
   const {
     connectionState, latestFrame, latestAnalysis,
-    messageLog, sessionUrl, sendCapture, sendAnalyze, sendAction, sendInit,
+    messageLog, sessionUrl, wsEndpoint, isNavigating, sendCapture, sendAnalyze, sendAction, sendInit,
+    retryConnection,
   } = useAgentSocket();
 
   const [objective, setObjective]   = useState("");
@@ -155,12 +156,19 @@ export default function PrismQA() {
     return () => { if (captureTimer.current) clearInterval(captureTimer.current); };
   }, [connectionState, isRunning, sendCapture]);
 
-  // ── Log sync ──────────────────────────────────────────────────────────────
+  // ── Log sync: append only new messages so we never duplicate entries or keys ─
   useEffect(() => {
     if (!messageLog.length) return;
-    const newest = messageLog[messageLog.length - 1];
-    if (!newest) return;
-    setLogEntries((p) => [...p, { id: nextId(), ts: Date.now(), msg: newest }]);
+    setLogEntries((p) => {
+      const need = messageLog.length - p.length;
+      if (need <= 0) return p;
+      const toAdd = messageLog.slice(p.length).map((msg) => ({
+        id: nextId(),
+        ts: Date.now(),
+        msg,
+      }));
+      return [...p, ...toAdd];
+    });
   }, [messageLog]);
 
   // ── Auto-scroll log ───────────────────────────────────────────────────────
@@ -394,13 +402,50 @@ export default function PrismQA() {
                 ) : (
                   <div style={{
                     position: "absolute", inset: 0, display: "flex",
-                    flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 10,
+                    flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 14,
                   }}>
                     <div className="shimmer" style={{ position: "absolute", inset: 0, opacity: 0.25 }} />
-                    <Eye size={20} color="var(--fg-3)" style={{ position: "relative" }} />
-                    <span style={{ position: "relative", fontSize: 9, letterSpacing: "0.18em", color: "var(--fg-2)", textTransform: "uppercase" }}>
-                      {connectionState === "connecting" ? "ESTABLISHING SESSION..." : connectionState === "connected" ? "AWAITING FRAME..." : "NO AGENT CONNECTION"}
-                    </span>
+                    {connectionState === "connecting" && (
+                      <Loader size={24} className="animate-spin" color="var(--A)" style={{ position: "relative" }} />
+                    )}
+                    {connectionState === "error" && (
+                      <>
+                        <span style={{ position: "relative", fontSize: 10, color: "var(--R)", textAlign: "center", maxWidth: 280 }}>
+                          Connection timed out. The backend may be starting up or unreachable.
+                        </span>
+                        <button
+                          type="button"
+                          onClick={retryConnection}
+                          style={{
+                            position: "relative",
+                            padding: "6px 14px",
+                            fontFamily: "var(--mono)",
+                            fontSize: 10,
+                            fontWeight: 700,
+                            letterSpacing: "0.1em",
+                            background: "var(--A)",
+                            color: "var(--bg-0)",
+                            border: "1px solid var(--A)",
+                            cursor: "pointer",
+                            textTransform: "uppercase",
+                          }}
+                        >
+                          Try again
+                        </button>
+                      </>
+                    )}
+                    {connectionState !== "error" && (
+                      <span className={connectionState === "connecting" ? "cold-start-pulse" : ""} style={{ position: "relative", fontSize: 9, letterSpacing: "0.12em", color: "var(--fg-2)", textTransform: "uppercase", textAlign: "center" }}>
+                        {connectionState === "connecting"
+                          ? "PROVISIONING CLOUD INFRASTRUCTURE... PLEASE WAIT"
+                          : connectionState === "connected"
+                            ? "AWAITING FRAME..."
+                            : "NO AGENT CONNECTION"}
+                      </span>
+                    )}
+                    {connectionState === "connected" && !latestFrame && (
+                      <Eye size={20} color="var(--fg-3)" style={{ position: "relative" }} />
+                    )}
                   </div>
                 )}
 
@@ -491,22 +536,22 @@ export default function PrismQA() {
               <button
                 id="connect-btn"
                 onClick={() => sendInit(targetUrl.trim())}
-                disabled={connectionState !== "connected" || !targetUrl.trim()}
+                disabled={connectionState !== "connected" || !targetUrl.trim() || isNavigating}
                 style={{
                   padding: "0 12px",
                   fontFamily: "var(--mono)",
                   fontSize: 10,
                   fontWeight: 700,
                   letterSpacing: "0.12em",
-                  background: sessionUrl ? "var(--bg-3)" : "var(--A)",
-                  color: sessionUrl ? "var(--fg-2)" : "var(--bg-0)",
-                  border: "1px solid " + (sessionUrl ? "var(--wire)" : "var(--A)"),
-                  cursor: connectionState === "connected" ? "pointer" : "not-allowed",
+                  background: isNavigating ? "var(--wire-2)" : sessionUrl ? "var(--bg-3)" : "var(--A)",
+                  color: sessionUrl && !isNavigating ? "var(--fg-2)" : "var(--bg-0)",
+                  border: "1px solid " + (isNavigating ? "var(--wire)" : sessionUrl ? "var(--wire)" : "var(--A)"),
+                  cursor: connectionState === "connected" && !isNavigating ? "pointer" : "not-allowed",
                   textTransform: "uppercase" as const,
                   whiteSpace: "nowrap" as const,
                 }}
               >
-                {sessionUrl ? "RECONNECT" : "CONNECT"}
+                {isNavigating ? <><Loader size={10} className="animate-spin" style={{ marginRight: 4 }} />NAVIGATING...</> : sessionUrl ? "RECONNECT" : "CONNECT"}
               </button>
             </div>
           </div>
@@ -535,7 +580,7 @@ export default function PrismQA() {
               value={objective}
               onChange={(e) => setObjective(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") execute(); }}
-              placeholder="e.g. Click the Sign In button"
+              placeholder={'e.g. Click Try it Yourself, add <p id="prism-test">run confirmed</p> in the code body, click Run, confirm "run confirmed" in the result pane'}
               disabled={connectionState !== "connected" || isRunning}
             />
             <button
@@ -549,6 +594,11 @@ export default function PrismQA() {
                 : <><Play size={11} />EXECUTE OBJECTIVE</>
               }
             </button>
+            {isRunning && (
+              <p style={{ margin: 0, fontSize: 10, color: "var(--fg-2)", fontStyle: "italic" }}>
+                Scroll + Gemini may take 1–2 min on long pages.
+              </p>
+            )}
           </div>
 
           {/* Latest verdict */}
@@ -635,7 +685,7 @@ export default function PrismQA() {
                 </span>
               </div>
             ) : (
-              logEntries.map((e) => <LogRow key={e.id} entry={e} />)
+              logEntries.map((e, i) => <LogRow key={`log-${i}-${e.id}`} entry={e} />)
             )}
           </div>
         </div>
@@ -653,7 +703,7 @@ export default function PrismQA() {
         <span style={{ color: "var(--wire-3)" }}>|</span>
         <span>PLAYWRIGHT/CHROMIUM</span>
         <span style={{ color: "var(--wire-3)" }}>|</span>
-        <span style={{ color: "var(--fg-2)" }}>WS {sessionUrl ?? "wss://prism-qa-backend-959993808456.us-central1.run.app/ws"}</span>
+        <span style={{ color: "var(--fg-2)" }}>WS {wsEndpoint}</span>
         <div style={{ flex: 1 }} />
         <span style={{ color: connectionState === "connected" ? "var(--G)" : "var(--R)" }}>
           {connectionState.toUpperCase()}

@@ -334,6 +334,14 @@ body {
 }
 @keyframes shimmer { to { background-position: -200% 0; } }
 
+.cold-start-pulse {
+  animation: cold-start-pulse 1.4s ease-in-out infinite;
+}
+@keyframes cold-start-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}
+
 /* ─── Connection badge ───────────────────────────────────────────────────── */
 .badge {
   font-family: var(--mono);

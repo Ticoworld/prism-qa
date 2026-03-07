@@ -3,6 +3,8 @@
 # Run from the backend/ directory.
 # Requires: gcloud CLI authenticated + billing-enabled project set.
 #
+# Set GOOGLE_GENAI_API_KEY in Cloud Run (Console → Edit → Variables) if not already set.
+#
 # Usage:   bash deploy.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
@@ -21,7 +23,8 @@ gcloud run deploy prism-qa-backend \
   --max-instances 1 \
   --session-affinity \
   --memory 2Gi \
-  --allow-unauthenticated
+  --allow-unauthenticated \
+  --set-env-vars "WS_SECRET_TOKEN=prism_secure_hackathon_token_2026"
 
 echo ""
 echo "  Deployment complete."

@@ -44,6 +44,12 @@ const SOM_SCHEMA = {
         "The action to execute on the identified element. " +
         "One of: click | type | scroll | navigate | wait | verify | none.",
     },
+    scroll_direction: {
+      type: Type.STRING,
+      enum: ["up", "down"],
+      description:
+        'Only used when action_type is "scroll". Set to "down" to scroll down by one viewport height, or "up" to scroll up. Omit or leave empty for non-scroll actions.',
+    },
     input_text: {
       type: Type.STRING,
       description:
@@ -98,12 +104,13 @@ PROCESS:
 4. Return the integer badge number as target_id.
 5. Set action_type to the correct action for that element.
 6. Set task_status based on the current state of the overall objective.
-7. Write one concise sentence in reasoning, identifying which badge number was selected and why. If task_status is "completed" or "failed", describe what visual evidence confirms that status.
+7. Write one concise sentence in reasoning, identifying which badge number was selected and why. If task_status is "completed" or "failed", describe what visual evidence confirms that status. Keep reasoning to one short sentence so the JSON is not truncated.
 
 TARGET_ID RULES:
 - Return the exact integer shown in the red badge.
 - If the objective requires no element interaction (wait, verify, none, completed, failed), return target_id = -1.
 - Never invent a target_id that does not appear as a badge in the screenshot.
+- If the objective requires interacting with an element that is not currently visible in the provided screenshot, you MUST output the SCROLL action (with scroll_direction "down" or "up" as appropriate). Do NOT guess or hallucinate badge IDs for elements you cannot see.
 
 TASK STATUS EVALUATION (CRITICAL):
 - "in_progress": The objective is NOT fully met. More actions are required. Return the next action.
@@ -114,6 +121,10 @@ TASK STATUS EVALUATION (CRITICAL):
   HTTP 500 page, or blank/broken layout. Document the exact visual error in reasoning.
   When returning "failed", set action_type to "none" and target_id to -1.
 
+CRITICAL NAVIGATION RULE: You are strictly forbidden from returning a FAILED status or a NONE action simply because the target element is not visible in the current initial viewport. Web pages are long. If the objective requires interacting with an element you cannot currently see, you MUST return the SCROLL action to navigate the page. You may only return a FAILED status if you have scrolled the entire page and mathematically confirmed the element does not exist.
+
+MEMORY AND LOOP PREVENTION: You are provided with an Action History. You are strictly forbidden from repeating the exact same action twice in a row. If your last action was CLICK badge N, and the new screenshot looks identical, the click failed. You MUST choose a different badge, output the SCROLL action to find new elements, or output a FAILED status. Repeating an action is a critical failure.
+
 DATA ENTRY RULES:
 - If the objective requires entering text into a field, set action_type to "type" — NOT "click".
 - Set target_id to the badge number of the INPUT or TEXTAREA element.
@@ -123,10 +134,15 @@ DATA ENTRY RULES:
 ACTION TYPES:
 - click     → single left-click on the element with this target_id
 - type      → focus + keyboard input; ALWAYS set input_text to exact string
-- scroll    → scroll the element or page
+- scroll    → scroll the page by one viewport; set scroll_direction to "up" or "down"; target_id = -1
 - navigate  → full page navigation; set input_text to URL; target_id = -1
 - wait      → element not yet visible; target_id = -1
 - none      → used when task_status is "completed" or "failed"
+
+LINK TEXT MATCH (CRITICAL): When the objective asks to click a link by name (e.g. "Privacy policy", "Terms of Use", "Contact us"), you MUST select the element whose visible text matches that name exactly or is the full phrase. Do NOT click a link that only contains a substring (e.g. do NOT click "policy", "CheckUser policy", or "Terms of service" when the objective says "Privacy policy"). If you only see partial matches (e.g. "policy" but not "Privacy policy"), keep scrolling to find the exact link or return task_status "failed" with reasoning that the exact link was not found. Set task_status to "completed" only when the element you are clicking has visible text that matches the objective's link description.
+- If the session history already shows "Clicked badge N" and the objective is still not achieved (e.g. wrong link was clicked), do NOT return the same target_id again. Choose a different badge that exactly matches the objective link text, or return task_status "failed" with reasoning.
+
+CODE EDITOR + RUN (e.g. W3Schools Tryit): When the objective is to edit code and click Run, the result of Run appears in the main preview/result pane (the rendered output of the edited document). If the page has an iframe with its own src (e.g. demo_iframe.htm), that iframe content does NOT change when you edit the main code — and that is expected. Do NOT return "failed" with "changes won't appear inside the iframe". Instead, add the requested HTML in the editable code (e.g. inside <body>), click Run, then confirm the new content appears in the main result area (outside the iframe). Set "completed" when you see that content in the preview.
 
 NATIVE DROPDOWN RULE (CRITICAL):
 Native HTML <select> dropdowns render their options via the OS, not the DOM. You cannot click their options.
@@ -147,6 +163,8 @@ STRICT RULE: Return only valid JSON. No prose, no markdown, no code fences.`;
 export interface GeminiVerdict {
   target_id: number;
   action_type: string;
+  /** When action_type is "scroll", must be "up" or "down". */
+  scroll_direction?: "up" | "down";
   input_text: string;
   is_error_state: boolean;
   task_status: "in_progress" | "completed" | "failed";
@@ -211,7 +229,7 @@ export async function analyzeMarkedScreenshot(
         responseMimeType: "application/json",
         responseSchema: SOM_SCHEMA,
         temperature: 0,
-        maxOutputTokens: 1024,
+        maxOutputTokens: 2048,
       },
     });
 
@@ -225,16 +243,76 @@ export async function analyzeMarkedScreenshot(
     try {
       parsed = JSON.parse(raw);
     } catch {
-      console.error(`[agent] Malformed JSON from Gemini: ${raw.slice(0, 300)}`);
-      return safeFailure("Model hallucination or truncated JSON.");
+      // Often truncation: response cut mid-key (e.g. "is_error). Try closing the object.
+      const repaired = tryRepairTruncatedJson(raw);
+      if (repaired !== null) {
+        parsed = repaired;
+      } else {
+        console.error(`[agent] Malformed JSON from Gemini: ${raw.slice(0, 300)}`);
+        return safeFailure(
+          "System Error: You returned malformed JSON. You MUST output strictly valid JSON.",
+        );
+      }
     }
 
-    return validateVerdict(parsed);
+    try {
+      return validateVerdict(parsed);
+    } catch {
+      console.error(`[agent] Invalid verdict shape from Gemini: ${raw.slice(0, 300)}`);
+      return safeFailure(
+        "System Error: You returned malformed JSON. You MUST output strictly valid JSON.",
+      );
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[agent] Gemini API error: ${msg}`);
     return safeFailure(`Gemini API error: ${msg}`);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Truncation repair — Gemini sometimes returns cut-off JSON
+// ---------------------------------------------------------------------------
+const REQUIRED_KEYS = [
+  "target_id",
+  "action_type",
+  "input_text",
+  "is_error_state",
+  "task_status",
+  "reasoning",
+] as const;
+
+const DEFAULTS: Record<string, unknown> = {
+  target_id: -1,
+  action_type: "none",
+  input_text: "",
+  is_error_state: false,
+  task_status: "in_progress",
+  reasoning: "",
+};
+
+function tryRepairTruncatedJson(raw: string): unknown | null {
+  const s = raw.trim();
+  const attempts: string[] = [
+    s + "}",
+    s + "\"}",
+    s + "_state\":false,\"task_status\":\"in_progress\",\"reasoning\":\"\"}",
+  ];
+  for (const candidate of attempts) {
+    try {
+      const parsed = JSON.parse(candidate);
+      if (typeof parsed === "object" && parsed !== null) {
+        for (const key of REQUIRED_KEYS) {
+          if (!(key in parsed) || parsed[key] === undefined)
+            parsed[key] = DEFAULTS[key];
+        }
+        return parsed;
+      }
+    } catch {
+      continue;
+    }
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
