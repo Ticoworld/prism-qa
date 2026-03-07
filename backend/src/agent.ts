@@ -78,6 +78,12 @@ const SOM_SCHEMA = {
         "One concise sentence identifying which badge number was selected and why. " +
         'If task_status is "completed" or "failed", describe what visual evidence confirms that status.',
     },
+    confidence_score: {
+      type: Type.NUMBER,
+      description:
+        "Your visual certainty for the chosen action. An integer between 0 and 100. " +
+        "100 = target is perfectly visible and unambiguous; lower = less certain.",
+    },
   },
   required: [
     "target_id",
@@ -86,6 +92,7 @@ const SOM_SCHEMA = {
     "is_error_state",
     "task_status",
     "reasoning",
+    "confidence_score",
   ],
 };
 
@@ -105,6 +112,7 @@ PROCESS:
 5. Set action_type to the correct action for that element.
 6. Set task_status based on the current state of the overall objective.
 7. Write one concise sentence in reasoning, identifying which badge number was selected and why. If task_status is "completed" or "failed", describe what visual evidence confirms that status. Keep reasoning to one short sentence so the JSON is not truncated.
+8. You must evaluate your visual certainty for the chosen action. Output an integer confidence_score between 0 and 100. 100 means the target is perfectly visible and unambiguous; lower values mean less certainty.
 
 TARGET_ID RULES:
 - Return the exact integer shown in the red badge.
@@ -169,6 +177,8 @@ export interface GeminiVerdict {
   is_error_state: boolean;
   task_status: "in_progress" | "completed" | "failed";
   reasoning: string;
+  /** 0–100 visual certainty for the chosen action. */
+  confidence_score: number;
 }
 
 export interface AnalyzeOptions {
@@ -209,6 +219,7 @@ export async function analyzeMarkedScreenshot(
     is_error_state: true,
     task_status: "failed",
     reasoning: reason,
+    confidence_score: 0,
   });
 
   try {
@@ -280,6 +291,7 @@ const REQUIRED_KEYS = [
   "is_error_state",
   "task_status",
   "reasoning",
+  "confidence_score",
 ] as const;
 
 const DEFAULTS: Record<string, unknown> = {
@@ -289,6 +301,7 @@ const DEFAULTS: Record<string, unknown> = {
   is_error_state: false,
   task_status: "in_progress",
   reasoning: "",
+  confidence_score: 50,
 };
 
 function tryRepairTruncatedJson(raw: string): unknown | null {
@@ -331,6 +344,7 @@ function validateVerdict(raw: unknown): GeminiVerdict {
     "is_error_state",
     "task_status",
     "reasoning",
+    "confidence_score",
   ];
   for (const f of required) {
     if (!(f in obj)) throw new Error(`[agent] Missing field: "${f}"`);
@@ -345,6 +359,11 @@ function validateVerdict(raw: unknown): GeminiVerdict {
     throw new Error("[agent] is_error_state must be a boolean");
   if (typeof obj["reasoning"] !== "string")
     throw new Error("[agent] reasoning must be a string");
+  if (typeof obj["confidence_score"] !== "number")
+    throw new Error("[agent] confidence_score must be a number");
+  const score = Number(obj["confidence_score"]);
+  if (score < 0 || score > 100)
+    throw new Error("[agent] confidence_score must be between 0 and 100");
   const validStatuses = ["in_progress", "completed", "failed"];
   if (!validStatuses.includes(String(obj["task_status"]))) {
     throw new Error(

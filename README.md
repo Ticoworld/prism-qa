@@ -6,16 +6,29 @@ Prism QA is a deterministic, stateful visual testing agent that autonomously nav
 
 ## System Architecture
 
-Our engine relies on a stateful execution loop and a **Set-of-Mark visual grounding pipeline** to prevent coordinate hallucinations.
+Our engine relies on a stateful execution loop and a **Set-of-Mark visual grounding pipeline** to prevent coordinate hallucinations. The diagram below maps the full cloud infrastructure (Vercel, Cloud Run, Playwright, SoM, Gemini, WebSocket auth, and CI/CD webhook).
 
-```
-Next.js Frontend (Dashboard & Command Center)
-        ↓ [Persistent WebSockets]
-Node.js Backend (Stateful Playwright Chromium Container)
-        ↓ [Google GenAI SDK]
-Gemini 2.5 Flash (Multimodal Vision & Reasoning)
-        ↓ [Set-of-Mark DOM Injection]
-Target Web Application
+```mermaid
+graph TD
+    UI[Next.js Dashboard on Vercel]
+    CI[GitHub Actions CI/CD Pipeline]
+    WS[Secure WebSocket Connection]
+    API[REST API Webhook]
+    CR[Google Cloud Run Container]
+    PW[Playwright Headless Browser]
+    SOM[Set-of-Mark DOM Injection]
+    LLM[Gemini 2.5 Flash API]
+
+    UI -- Authenticated Handshake --> WS
+    WS -- Streams Telemetry & Commands --> CR
+    CI -- POST Request with Bearer Token --> API
+    API -- Headless Execution --> CR
+    CR -- Orchestrates --> PW
+    PW -- Renders Target URL --> SOM
+    SOM -- Injects Badges & Compresses JPEG --> CR
+    CR -- Transmits Visual Payload & Context --> LLM
+    LLM -- Returns Action JSON & Confidence Score --> CR
+    CR -- Executes Native DOM Action --> PW
 ```
 
 ---

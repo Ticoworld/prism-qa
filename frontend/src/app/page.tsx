@@ -650,6 +650,30 @@ export default function PrismQA() {
             </div>
           )}
 
+          {/* Telemetry panel */}
+          <div style={{
+            display: "flex", gap: 16, padding: "8px 10px", borderBottom: "1px solid var(--wire)",
+            background: "var(--bg-2)", flexShrink: 0,
+            fontSize: 9, letterSpacing: "0.1em", color: "var(--fg-2)", textTransform: "uppercase",
+          }}>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              Confidence Score:
+              <span style={{ color: "var(--fg-1)", fontFamily: "var(--mono)", fontWeight: 700 }}>
+                {latestAnalysis?.action?.confidence_score != null
+                  ? `${latestAnalysis.action.confidence_score}%`
+                  : "---"}
+              </span>
+            </span>
+            <span style={{ display: "flex", alignItems: "center", gap: 4 }}>
+              System Latency:
+              <span style={{ color: "var(--fg-1)", fontFamily: "var(--mono)", fontWeight: 700 }}>
+                {latestAnalysis?.injection_latency_ms != null
+                  ? `${latestAnalysis.injection_latency_ms}ms`
+                  : "---"}
+              </span>
+            </span>
+          </div>
+
           {/* Terminal log header */}
           <div style={{
             height: 28, display: "flex", alignItems: "center", gap: 6,

@@ -124,6 +124,8 @@ interface WireQaAction {
   is_error_state: boolean;
   task_status: "in_progress" | "completed" | "failed";
   reasoning: string;
+  /** 0–100 from Gemini. */
+  confidence_score?: number;
 }
 
 interface AnalyzeResult {
@@ -131,6 +133,8 @@ interface AnalyzeResult {
   action: WireQaAction;
   objective: string;
   timestamp: number;
+  /** SoM inject + screenshot latency for this cycle (ms). */
+  injection_latency_ms?: number;
 }
 
 interface ErrorResult {
@@ -212,6 +216,127 @@ async function destroySession(session: Session): Promise<void> {
     await session.context.close();
   } catch {
     // Ignore errors during teardown — connection may already be dead
+  }
+}
+
+/** Max steps per CI run to avoid infinite loops. */
+const HEADLESS_MAX_STEPS = 40;
+
+/**
+ * Run the full SoM + Gemini loop headlessly (no WebSocket). Used by POST /api/run-test.
+ */
+async function runHeadlessTest(
+  url: string,
+  objective: string,
+): Promise<{ status: string; steps: number; history: string[] }> {
+  const b = await getBrowser();
+  const context = await b.newContext({
+    viewport: { width: 1280, height: 800 },
+    userAgent:
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  });
+  const page = await context.newPage();
+  await page.route("**/*.{woff,woff2,ttf,otf,eot}", (route) => route.abort());
+  const session: Session = { context, page };
+
+  try {
+    try {
+      await page.goto(url, { waitUntil: "domcontentloaded", timeout: 45_000 });
+    } catch (navErr) {
+      const errMsg = navErr instanceof Error ? navErr.message : String(navErr);
+      if (errMsg.includes("Timeout") || errMsg.includes("timeout")) {
+        // proceed with current document
+      } else {
+        throw navErr;
+      }
+    }
+    await page.waitForTimeout(2_000);
+
+    const history: string[] = [];
+    let lastStatus = "in_progress";
+    let steps = 0;
+
+    while (steps < HEADLESS_MAX_STEPS) {
+      const wireAction = await handleAnalyze(
+        { type: "analyze", objective },
+        session,
+        null,
+        history,
+      );
+      if (!wireAction) break;
+      lastStatus = wireAction.task_status;
+      steps++;
+
+      if (wireAction.task_status === "completed" || wireAction.task_status === "failed") {
+        history.push(
+          `[${wireAction.task_status.toUpperCase()}] ${wireAction.reasoning}`,
+        );
+        break;
+      }
+
+      // Record and execute action
+      if (wireAction.action_type === "click") {
+        history.push(
+          `Clicked badge ${wireAction.target_id} at (${wireAction.x_coordinate}, ${wireAction.y_coordinate})`,
+        );
+        await handleAction(
+          {
+            type: "action",
+            action: "click",
+            x: wireAction.x_coordinate,
+            y: wireAction.y_coordinate,
+            target_id: wireAction.target_id,
+          },
+          session,
+        );
+      } else if (wireAction.action_type === "type") {
+        history.push(
+          `Typed into element at (${wireAction.x_coordinate}, ${wireAction.y_coordinate})`,
+        );
+        await handleAction(
+          {
+            type: "action",
+            action: "type",
+            text: wireAction.input_text,
+            x: wireAction.x_coordinate,
+            y: wireAction.y_coordinate,
+            target_id: wireAction.target_id,
+          },
+          session,
+        );
+      } else if (wireAction.action_type === "scroll") {
+        const dir = wireAction.scroll_direction ?? "down";
+        history.push(`Scrolled page ${dir}`);
+        await handleAction(
+          {
+            type: "action",
+            action: "scroll",
+            x: 0,
+            y: 0,
+            direction: dir,
+          },
+          session,
+        );
+      } else if (wireAction.action_type === "navigate") {
+        history.push(`Navigated to ${wireAction.input_text}`);
+        await handleAction(
+          {
+            type: "action",
+            action: "navigate",
+            url: wireAction.input_text,
+          },
+          session,
+        );
+      } else {
+        history.push(`Action: ${wireAction.action_type} — ${wireAction.reasoning}`);
+      }
+    }
+
+    return { status: lastStatus, steps, history };
+  } finally {
+    await cleanupMarks(session.page);
+    await destroySession(session);
   }
 }
 
@@ -553,18 +678,20 @@ function isDuplicateAction(verdict: GeminiVerdict, history: string[]): boolean {
 async function handleAnalyze(
   msg: AnalyzeMessage,
   session: Session,
-  socket: WebSocket,
+  socket: WebSocket | null,
   history: string[],
-): Promise<void> {
+): Promise<WireQaAction | void> {
   console.log(`[som] Injecting marks for: "${msg.objective}"`);
 
   await session.page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
 
+  let injectionLatencyMs = 0;
+
   // ── Step 1: inject visual anchors ──────────────────────────────────────
+  // ── Step 2: screenshot WITH marks visible ──────────────────────────────
+  const t0 = performance.now();
   let elementMap = await injectMarks(session.page);
   console.log(`[som] ${elementMap.length} interactive elements marked.`);
-
-  // ── Step 2: screenshot WITH marks visible ──────────────────────────────
   let buffer = await session.page.screenshot({
     type: "jpeg",
     quality: 50,
@@ -574,7 +701,8 @@ async function handleAnalyze(
     timeout: 10_000,
   });
   let imageBase64 = buffer.toString("base64");
-  console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
+  injectionLatencyMs = Math.round(performance.now() - t0);
+  console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB (injection+capture: ${injectionLatencyMs}ms)`);
 
   // ── Step 3: ask Gemini; loop if it returns SCROLL ──────────────────────
   let verdict: GeminiVerdict;
@@ -615,6 +743,7 @@ async function handleAnalyze(
 
       await session.page.waitForTimeout(1_000);
 
+      const tScroll = performance.now();
       elementMap = await injectMarks(session.page);
       buffer = await session.page.screenshot({
         type: "jpeg",
@@ -625,7 +754,8 @@ async function handleAnalyze(
         timeout: 10_000,
       });
       imageBase64 = buffer.toString("base64");
-      console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
+      injectionLatencyMs = Math.round(performance.now() - tScroll);
+      console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB (injection+capture: ${injectionLatencyMs}ms)`);
       verdict = await analyzeMarkedScreenshot({
         imageBase64,
         objective: msg.objective,
@@ -645,6 +775,7 @@ async function handleAnalyze(
       );
       duplicateCount++;
       await cleanupMarks(session.page);
+      const tDup = performance.now();
       elementMap = await injectMarks(session.page);
       buffer = await session.page.screenshot({
         type: "jpeg",
@@ -655,6 +786,7 @@ async function handleAnalyze(
         timeout: 10_000,
       });
       imageBase64 = buffer.toString("base64");
+      injectionLatencyMs = Math.round(performance.now() - tDup);
       console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
       verdict = await analyzeMarkedScreenshot({
         imageBase64,
@@ -675,6 +807,7 @@ async function handleAnalyze(
       history.push(verdict.reasoning);
       malformedRetries++;
       await cleanupMarks(session.page);
+      const tMal = performance.now();
       elementMap = await injectMarks(session.page);
       buffer = await session.page.screenshot({
         type: "jpeg",
@@ -685,6 +818,7 @@ async function handleAnalyze(
         timeout: 10_000,
       });
       imageBase64 = buffer.toString("base64");
+      injectionLatencyMs = Math.round(performance.now() - tMal);
       console.log(`[som] Screenshot base64 size: ${(imageBase64.length / 1024).toFixed(1)} KB`);
       verdict = await analyzeMarkedScreenshot({
         imageBase64,
@@ -731,20 +865,26 @@ async function handleAnalyze(
     is_error_state: verdict.is_error_state,
     task_status: verdict.task_status,
     reasoning: verdict.reasoning,
+    confidence_score: verdict.confidence_score,
   };
 
-  send(socket, {
-    type: "analyze_result",
-    action: wireAction,
-    objective: msg.objective,
-    timestamp: Date.now(),
-  });
+  if (socket) {
+    send(socket, {
+      type: "analyze_result",
+      action: wireAction,
+      objective: msg.objective,
+      timestamp: Date.now(),
+      injection_latency_ms: injectionLatencyMs,
+    });
+  } else {
+    return wireAction;
+  }
 }
 
 async function handleAction(
   msg: InboundMessage,
   session: Session,
-  socket: WebSocket,
+  socket?: WebSocket,
 ): Promise<void> {
   if (msg.type !== "action") return;
 
@@ -838,11 +978,13 @@ async function handleAction(
   const postActionDelay = msg.action === "click" ? 2_500 : 1_000;
   await session.page.waitForTimeout(postActionDelay);
 
-  send(socket, {
-    type: "action_ack",
-    action: msg.action,
-    timestamp: Date.now(),
-  });
+  if (socket) {
+    send(socket, {
+      type: "action_ack",
+      action: msg.action,
+      timestamp: Date.now(),
+    });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -854,7 +996,7 @@ app.use(express.json());
 app.use((_req: Request, res: Response, next: express.NextFunction) => {
   res.setHeader("Access-Control-Allow-Origin", ALLOWED_ORIGIN);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   next();
 });
 
@@ -866,6 +1008,67 @@ app.get("/health", (_req: Request, res: Response) => {
     activeSessions: wss?.clients.size ?? 0,
     timestamp: new Date().toISOString(),
   });
+});
+
+// ---------------------------------------------------------------------------
+// CI/CD webhook — headless test run (Bearer token required)
+// ---------------------------------------------------------------------------
+app.post("/api/run-test", async (req: Request, res: Response) => {
+  const authHeader = req.headers.authorization;
+  const secret = process.env["WS_SECRET_TOKEN"];
+  const token =
+    authHeader?.startsWith("Bearer ") ? authHeader.slice(7) : undefined;
+  if (!secret || token !== secret) {
+    res.status(401).json({ error: "Unauthorized", code: "INVALID_TOKEN" });
+    return;
+  }
+
+  let url: string;
+  let objective: string;
+  try {
+    const body = req.body as { url?: string; objective?: string };
+    if (typeof body?.url !== "string" || typeof body?.objective !== "string") {
+      res.status(400).json({
+        error: "Missing or invalid body",
+        code: "BAD_REQUEST",
+        expected: { url: "string", objective: "string" },
+      });
+      return;
+    }
+    url = body.url.trim();
+    objective = body.objective.trim();
+    if (!url || !objective) {
+      res.status(400).json({
+        error: "url and objective must be non-empty",
+        code: "BAD_REQUEST",
+      });
+      return;
+    }
+  } catch {
+    res.status(400).json({ error: "Invalid JSON body", code: "BAD_REQUEST" });
+    return;
+  }
+
+  try {
+    console.log(
+      `[api] Run-test started: ${url} — "${objective.length > 60 ? objective.slice(0, 60) + "..." : objective}"`,
+    );
+    const result = await runHeadlessTest(url, objective);
+    console.log(`[api] Run-test finished: status=${result.status}, steps=${result.steps}`);
+    res.status(200).json({
+      status: result.status,
+      steps: result.steps,
+      history: result.history,
+    });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[api] Run-test error: ${message}`);
+    res.status(500).json({
+      error: "Test run failed",
+      code: "RUN_ERROR",
+      message,
+    });
+  }
 });
 
 // ---------------------------------------------------------------------------

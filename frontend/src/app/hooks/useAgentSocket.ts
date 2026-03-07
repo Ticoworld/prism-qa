@@ -16,6 +16,8 @@ export interface QaAction {
   is_error_state: boolean;
   task_status: "in_progress" | "completed" | "failed";
   reasoning: string;
+  /** 0–100 from Gemini. */
+  confidence_score?: number;
 }
 
 export interface SessionReadyMessage {
@@ -36,6 +38,8 @@ export interface AnalyzeResultMessage {
   action: QaAction;
   objective: string;
   timestamp: number;
+  /** SoM inject + screenshot latency (ms). */
+  injection_latency_ms?: number;
 }
 
 export interface ActionAckMessage {
