@@ -19,6 +19,9 @@ const ALLOWED_ORIGIN = process.env["ALLOWED_ORIGIN"] ?? "http://localhost:3000";
 const PLAYWRIGHT_HEADLESS = process.env["PLAYWRIGHT_HEADLESS"] !== "false";
 const DEFAULT_URL = process.env["DEFAULT_URL"] ?? "http://localhost:3002";
 
+/** Screenshot capture timeout (ms). Heavy pages like GitHub need more than 10s. */
+const SCREENSHOT_TIMEOUT_MS = 25_000;
+
 // ---------------------------------------------------------------------------
 // Message protocol — inbound from frontend
 // ---------------------------------------------------------------------------
@@ -65,6 +68,11 @@ interface ActionScrollMessage {
   direction?: "up" | "down";
 }
 
+interface ActionEscapeMessage {
+  type: "action";
+  action: "press_escape";
+}
+
 interface InitMessage {
   type: "init";
   /** URL to navigate the browser session to */
@@ -83,6 +91,7 @@ type InboundMessage =
   | ActionTypeMessage
   | ActionNavigateMessage
   | ActionScrollMessage
+  | ActionEscapeMessage
   | InitMessage
   | AnalyzeMessage;
 
@@ -328,6 +337,12 @@ async function runHeadlessTest(
           },
           session,
         );
+      } else if (wireAction.action_type === "press_escape") {
+        history.push("Pressed Escape");
+        await handleAction(
+          { type: "action", action: "press_escape" },
+          session,
+        );
       } else {
         history.push(`Action: ${wireAction.action_type} — ${wireAction.reasoning}`);
       }
@@ -384,16 +399,21 @@ function collectFrames(page: Page): Frame[] {
   return out.slice(0, MAX_FRAMES_FOR_SOM);
 }
 
-/** Per-frame injection: run inside a single frame. Returns marks (frame-relative coords) and nextId. */
+/** Per-frame injection: run inside a single frame. Returns marks, nextId, and textMap. Occlusion: only badge elements whose center is not covered by a solid overlay. */
 async function injectMarksInFrame(
   frame: Frame,
   startId: number,
-): Promise<{ marks: { id: number; centerX: number; centerY: number; tag: string }[]; nextId: number }> {
+): Promise<{
+  marks: { id: number; centerX: number; centerY: number; tag: string }[];
+  nextId: number;
+  textMap: Record<number, string>;
+}> {
   return frame.evaluate(
     (arg: { sel: string; sid: number }) => {
       const { sel, sid } = arg;
       const elements = Array.from(document.querySelectorAll<HTMLElement>(sel));
       const marks: { id: number; centerX: number; centerY: number; tag: string }[] = [];
+      const textMap: Record<number, string> = {};
       let id = sid;
       for (const el of elements) {
         const rect = el.getBoundingClientRect();
@@ -401,6 +421,29 @@ async function injectMarksInFrame(
         const cs = window.getComputedStyle(el);
         if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
           continue;
+
+        const cx = Math.round(rect.left + rect.width / 2);
+        const cy = Math.round(rect.top + rect.height / 2);
+        const top = document.elementFromPoint(cx, cy);
+        if (top === null) continue;
+        if (top !== el && !el.contains(top)) {
+          const topCs = window.getComputedStyle(top);
+          const transparent =
+            topCs.pointerEvents === "none" || parseFloat(topCs.opacity) === 0;
+          if (!transparent) continue;
+        }
+
+        const label = (
+          (el as HTMLElement).innerText ||
+          (el as HTMLInputElement).value ||
+          el.getAttribute("aria-label") ||
+          el.getAttribute("placeholder") ||
+          (el as HTMLElement).title ||
+          (el as HTMLImageElement).alt ||
+          ""
+        ).trim().slice(0, 30);
+        textMap[id] = label;
+
         el.setAttribute("data-prism-id", String(id));
         el.style.setProperty("outline", "2px solid #ff0000", "important");
         el.style.setProperty("outline-offset", "1px", "important");
@@ -427,31 +470,31 @@ async function injectMarksInFrame(
         document.body.appendChild(badge);
         marks.push({
           id,
-          centerX: Math.round(rect.left + rect.width / 2),
-          centerY: Math.round(rect.top + rect.height / 2),
+          centerX: cx,
+          centerY: cy,
           tag: el.tagName.toLowerCase(),
         });
         id++;
       }
-      return { marks, nextId: id };
+      return { marks, nextId: id, textMap };
     },
     { sel: SOM_SELECTORS, sid: startId },
   );
 }
 
 /**
- * Inject visual bounding boxes + numbered red badges into the main page and all
- * same-origin iframes. Badge IDs are globally unique. Returns element map with
- * coordinates in main-page viewport (iframe elements offset by iframe rect).
- */
-/**
  * Inject SoM into main frame and all same-origin iframes.
  * Cross-origin iframes are skipped (browser security); only same-origin embeds get badges.
+ * Returns element map (main-viewport coords) and DOM text map (badge id → up to 30 chars).
  */
-async function injectMarks(page: Page): Promise<ElementMark[]> {
+async function injectMarks(page: Page): Promise<{
+  elementMap: ElementMark[];
+  domTextMap: Record<number, string>;
+}> {
   const frames = collectFrames(page);
   let globalBadgeCounter = 1;
   const elementMap: ElementMark[] = [];
+  const domTextMap: Record<number, string> = {};
   let framesInjected = 0;
 
   for (const frame of frames) {
@@ -473,7 +516,7 @@ async function injectMarks(page: Page): Promise<ElementMark[]> {
     }
 
     try {
-      const { marks, nextId } = await injectMarksInFrame(frame, globalBadgeCounter);
+      const { marks, nextId, textMap } = await injectMarksInFrame(frame, globalBadgeCounter);
       for (const m of marks) {
         elementMap.push({
           id: m.id,
@@ -481,6 +524,8 @@ async function injectMarks(page: Page): Promise<ElementMark[]> {
           centerY: offsetY + m.centerY,
           tag: m.tag,
         });
+        const text = textMap[m.id];
+        if (text !== undefined) domTextMap[m.id] = text;
       }
       globalBadgeCounter = nextId;
       framesInjected++;
@@ -492,10 +537,10 @@ async function injectMarks(page: Page): Promise<ElementMark[]> {
   if (framesInjected > 1) {
     console.log(`[som] Injected marks into ${framesInjected} frames (main + iframes).`);
   }
-  return elementMap;
+  return { elementMap, domTextMap };
 }
 
-/** Per-frame: count visible interactive elements (same logic as inject). */
+/** Per-frame: count visible, non-occluded interactive elements (same logic as inject). */
 async function countElementsInFrame(frame: Frame): Promise<number> {
   return frame.evaluate((sel: string) => {
     const elements = Array.from(document.querySelectorAll<HTMLElement>(sel));
@@ -506,13 +551,23 @@ async function countElementsInFrame(frame: Frame): Promise<number> {
       const cs = window.getComputedStyle(el);
       if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
         continue;
+      const cx = Math.round(rect.left + rect.width / 2);
+      const cy = Math.round(rect.top + rect.height / 2);
+      const top = document.elementFromPoint(cx, cy);
+      if (top === null) continue;
+      if (top !== el && !el.contains(top)) {
+        const topCs = window.getComputedStyle(top);
+        const transparent =
+          topCs.pointerEvents === "none" || parseFloat(topCs.opacity) === 0;
+        if (!transparent) continue;
+      }
       count++;
     }
     return count;
   }, SOM_SELECTORS);
 }
 
-/** Per-frame: return current center of the Nth visible element (1-based). */
+/** Per-frame: return current center of the Nth visible, non-occluded element (1-based). */
 async function getCenterOfNthInFrame(
   frame: Frame,
   localIndex: number,
@@ -528,12 +583,19 @@ async function getCenterOfNthInFrame(
         const cs = window.getComputedStyle(el);
         if (cs.display === "none" || cs.visibility === "hidden" || parseFloat(cs.opacity) === 0)
           continue;
+        const cx = Math.round(rect.left + rect.width / 2);
+        const cy = Math.round(rect.top + rect.height / 2);
+        const top = document.elementFromPoint(cx, cy);
+        if (top === null) continue;
+        if (top !== el && !el.contains(top)) {
+          const topCs = window.getComputedStyle(top);
+          const transparent =
+            topCs.pointerEvents === "none" || parseFloat(topCs.opacity) === 0;
+          if (!transparent) continue;
+        }
         count++;
         if (count === idx) {
-          return {
-            x: Math.round(rect.left + rect.width / 2),
-            y: Math.round(rect.top + rect.height / 2),
-          };
+          return { x: cx, y: cy };
         }
       }
       return null;
@@ -605,6 +667,25 @@ async function cleanupMarksInFrame(frame: Frame): Promise<void> {
 }
 
 /**
+ * Dismiss overlays (Escape twice + brief wait). Use ONLY in recovery paths
+ * (duplicate-action or malformed-JSON retries), never at the start of a
+ * normal analyze. Reason: the previous action often opens UI we need (e.g.
+ * clicking the search icon opens the search bar/dropdown). If we Escape at
+ * the start of every analyze, we close that UI and the next screenshot
+ * shows "search bar not visible" → false failure.
+ */
+async function dismissOverlays(page: Page): Promise<void> {
+  try {
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(200);
+    await page.keyboard.press("Escape");
+    await page.waitForTimeout(300);
+  } catch {
+    // Ignore if page or keyboard is unavailable
+  }
+}
+
+/**
  * Remove all injected SoM overlays from the main page and every accessible
  * frame so the next clean screenshot has no visual artifacts.
  */
@@ -632,7 +713,7 @@ async function handleCapture(
     scale: "css",
     fullPage: false,
     animations: "disabled",
-    timeout: 10_000,
+    timeout: SCREENSHOT_TIMEOUT_MS,
   });
   send(socket, {
     type: "capture_result",
@@ -674,6 +755,11 @@ function isDuplicateAction(verdict: GeminiVerdict, history: string[]): boolean {
  * 5. Resolve target_id → precise center coordinates from element map
  * 6. Clean up all injected DOM nodes
  * 7. Send resolved WireQaAction to frontend
+ *
+ * We do NOT call dismissOverlays() at the start. The previous action (e.g.
+ * click search icon) often opens the UI we need next (search bar/dropdown).
+ * Escaping here would close it and cause "search bar not visible" failures.
+ * dismissOverlays is only used in retry paths (duplicate/malformed) to unstick.
  */
 async function handleAnalyze(
   msg: AnalyzeMessage,
@@ -683,14 +769,14 @@ async function handleAnalyze(
 ): Promise<WireQaAction | void> {
   console.log(`[som] Injecting marks for: "${msg.objective}"`);
 
-  await session.page.waitForLoadState("load", { timeout: 10_000 }).catch(() => {});
+  await session.page.waitForLoadState("load", { timeout: 15_000 }).catch(() => {});
 
   let injectionLatencyMs = 0;
 
   // ── Step 1: inject visual anchors ──────────────────────────────────────
   // ── Step 2: screenshot WITH marks visible ──────────────────────────────
   const t0 = performance.now();
-  let elementMap = await injectMarks(session.page);
+  let { elementMap, domTextMap } = await injectMarks(session.page);
   console.log(`[som] ${elementMap.length} interactive elements marked.`);
   let buffer = await session.page.screenshot({
     type: "jpeg",
@@ -698,7 +784,7 @@ async function handleAnalyze(
     scale: "css",
     fullPage: false,
     animations: "disabled",
-    timeout: 10_000,
+    timeout: SCREENSHOT_TIMEOUT_MS,
   });
   let imageBase64 = buffer.toString("base64");
   injectionLatencyMs = Math.round(performance.now() - t0);
@@ -711,6 +797,7 @@ async function handleAnalyze(
       imageBase64,
       objective: msg.objective,
       history,
+      domTextMap,
     });
 
     // SCROLL loop: execute scroll, re-inject, re-screenshot, re-ask Gemini until non-scroll
@@ -743,15 +830,18 @@ async function handleAnalyze(
 
       await session.page.waitForTimeout(1_000);
 
+      // No dismissOverlays here: scroll did not open a modal; keep current view.
       const tScroll = performance.now();
-      elementMap = await injectMarks(session.page);
+      const scrollInject = await injectMarks(session.page);
+      elementMap = scrollInject.elementMap;
+      domTextMap = scrollInject.domTextMap;
       buffer = await session.page.screenshot({
         type: "jpeg",
         quality: 50,
         scale: "css",
         fullPage: false,
         animations: "disabled",
-        timeout: 10_000,
+        timeout: SCREENSHOT_TIMEOUT_MS,
       });
       imageBase64 = buffer.toString("base64");
       injectionLatencyMs = Math.round(performance.now() - tScroll);
@@ -760,6 +850,7 @@ async function handleAnalyze(
         imageBase64,
         objective: msg.objective,
         history,
+        domTextMap,
       });
     }
 
@@ -775,15 +866,18 @@ async function handleAnalyze(
       );
       duplicateCount++;
       await cleanupMarks(session.page);
+      await dismissOverlays(session.page);
       const tDup = performance.now();
-      elementMap = await injectMarks(session.page);
+      const dupInject = await injectMarks(session.page);
+      elementMap = dupInject.elementMap;
+      domTextMap = dupInject.domTextMap;
       buffer = await session.page.screenshot({
         type: "jpeg",
         quality: 50,
         scale: "css",
         fullPage: false,
         animations: "disabled",
-        timeout: 10_000,
+        timeout: SCREENSHOT_TIMEOUT_MS,
       });
       imageBase64 = buffer.toString("base64");
       injectionLatencyMs = Math.round(performance.now() - tDup);
@@ -792,6 +886,7 @@ async function handleAnalyze(
         imageBase64,
         objective: msg.objective,
         history,
+        domTextMap,
       });
     }
 
@@ -807,15 +902,18 @@ async function handleAnalyze(
       history.push(verdict.reasoning);
       malformedRetries++;
       await cleanupMarks(session.page);
+      await dismissOverlays(session.page);
       const tMal = performance.now();
-      elementMap = await injectMarks(session.page);
+      const malInject = await injectMarks(session.page);
+      elementMap = malInject.elementMap;
+      domTextMap = malInject.domTextMap;
       buffer = await session.page.screenshot({
         type: "jpeg",
         quality: 50,
         scale: "css",
         fullPage: false,
         animations: "disabled",
-        timeout: 10_000,
+        timeout: SCREENSHOT_TIMEOUT_MS,
       });
       imageBase64 = buffer.toString("base64");
       injectionLatencyMs = Math.round(performance.now() - tMal);
@@ -824,6 +922,7 @@ async function handleAnalyze(
         imageBase64,
         objective: msg.objective,
         history,
+        domTextMap,
       });
     }
   } finally {
@@ -924,6 +1023,8 @@ async function handleAction(
       } else {
         await waitForNavigationIfAny(session.page);
       }
+      // Let UI settle (e.g. search dropdown, modal) before next analyze captures.
+      await session.page.waitForTimeout(600);
       break;
     }
     case "type": {
@@ -943,6 +1044,7 @@ async function handleAction(
       await session.page.keyboard.type(msg.text);
       await session.page.keyboard.press("Enter");
       await waitForNavigationIfAny(session.page);
+      await session.page.waitForTimeout(600);
       break;
     }
     case "navigate": {
@@ -970,6 +1072,10 @@ async function handleAction(
       } else {
         await session.page.mouse.wheel(msg.deltaX ?? 0, msg.deltaY ?? 0);
       }
+      break;
+    }
+    case "press_escape": {
+      await session.page.keyboard.press("Escape");
       break;
     }
   }
@@ -1187,6 +1293,8 @@ wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
               ? `Scrolled page ${msg.direction}`
               : `Scrolled page (deltaX: ${msg.deltaX ?? 0}, deltaY: ${msg.deltaY ?? 0})`;
           sessionHistory.push(desc);
+        } else if (msg.action === "press_escape") {
+          sessionHistory.push("Pressed Escape");
         }
         await handleAction(msg, session, socket);
       } else if (msg.type === "analyze") {

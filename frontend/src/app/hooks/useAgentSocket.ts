@@ -296,6 +296,8 @@ export function useAgentSocket(): UseAgentSocketReturn {
           y: action.y_coordinate,
           direction: action.scroll_direction ?? "down",
         });
+      } else if (action.action_type === "press_escape") {
+        sendRaw({ type: "action", action: "press_escape" });
       }
       // wait / verify / none → no physical action sent
     },

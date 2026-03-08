@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets — do not commit
+.env
+.env.local
+.env.*.local
+# Keep .env.example (template with no secrets)
+!.env.example
+
+# Build
+dist/
+
+# Logs
+*.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+
+# Playwright
+test-results/
+playwright-report/

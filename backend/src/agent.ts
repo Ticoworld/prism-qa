@@ -31,18 +31,23 @@ const MODEL = "gemini-2.5-flash";
 const SOM_SCHEMA = {
   type: Type.OBJECT,
   properties: {
+    scene_understanding: {
+      type: Type.STRING,
+      description:
+        "Brief analysis of the current visual state. Identify if any dropdowns, modals, or error screens are present. Required before selecting an action.",
+    },
     target_id: {
       type: Type.NUMBER,
       description:
         "The numeric ID shown inside the red badge on the target element. " +
         "Return -1 if the action does not require a specific element " +
-        '(e.g. action_type is "wait", "verify", "none", "completed", or "failed").',
+        '(e.g. action_type is "wait", "verify", "none", "completed", "failed", or "press_escape").',
     },
     action_type: {
       type: Type.STRING,
       description:
         "The action to execute on the identified element. " +
-        "One of: click | type | scroll | navigate | wait | verify | none.",
+        "One of: click | type | scroll | navigate | wait | verify | none | press_escape.",
     },
     scroll_direction: {
       type: Type.STRING,
@@ -86,6 +91,7 @@ const SOM_SCHEMA = {
     },
   },
   required: [
+    "scene_understanding",
     "target_id",
     "action_type",
     "input_text",
@@ -103,6 +109,12 @@ const SYSTEM_PROMPT = `You are an automated QA testing agent using a Set-of-Mark
 
 CONTEXT:
 Every interactive element in the screenshot has been marked with a distinctive red numeric badge in its top-left corner and a red border. These badges are your navigation system. You must use them — do NOT attempt to guess raw pixel coordinates.
+
+Before selecting an action, you must write a brief analysis of the current visual state in scene_understanding. Identify if any dropdowns, modals, or error screens are present.
+
+If a modal, dropdown, or overlay is blocking the screen, use the PRESS_ESCAPE action to dismiss it before attempting to interact with the UI.
+
+You are provided with a DOM Element Map (badge ID → visible text, e.g. placeholder or label). You MUST verify the exact text of a badge matches your target before clicking.
 
 PROCESS:
 1. Read the OBJECTIVE.
@@ -140,15 +152,19 @@ DATA ENTRY RULES:
 - The backend will click to focus before typing. You do not need a separate click step.
 
 ACTION TYPES:
-- click     → single left-click on the element with this target_id
-- type      → focus + keyboard input; ALWAYS set input_text to exact string
-- scroll    → scroll the page by one viewport; set scroll_direction to "up" or "down"; target_id = -1
-- navigate  → full page navigation; set input_text to URL; target_id = -1
-- wait      → element not yet visible; target_id = -1
-- none      → used when task_status is "completed" or "failed"
+- click         → single left-click on the element with this target_id
+- type          → focus + keyboard input; ALWAYS set input_text to exact string
+- scroll        → scroll the page by one viewport; set scroll_direction to "up" or "down"; target_id = -1
+- navigate      → full page navigation; set input_text to URL; target_id = -1
+- press_escape  → dismiss modal/dropdown/overlay; target_id = -1. Use when an overlay blocks the UI.
+- wait          → element not yet visible; target_id = -1
+- none          → used when task_status is "completed" or "failed"
 
-LINK TEXT MATCH (CRITICAL): When the objective asks to click a link by name (e.g. "Privacy policy", "Terms of Use", "Contact us"), you MUST select the element whose visible text matches that name exactly or is the full phrase. Do NOT click a link that only contains a substring (e.g. do NOT click "policy", "CheckUser policy", or "Terms of service" when the objective says "Privacy policy"). If you only see partial matches (e.g. "policy" but not "Privacy policy"), keep scrolling to find the exact link or return task_status "failed" with reasoning that the exact link was not found. Set task_status to "completed" only when the element you are clicking has visible text that matches the objective's link description.
+LINK TEXT MATCH (CRITICAL): When the objective asks to click a link by name (e.g. "Privacy policy", "facebook/react", "Terms of Use"), you MUST select the element whose visible text matches that name exactly or is the full phrase. Do NOT click a link that only contains a substring.
+- Example: If the objective says "click on the official facebook/react repository", you MUST choose a badge whose visible text is exactly "facebook/react" or "Facebook/react" (org/repo format). Do NOT click a badge that shows a different repo (e.g. "duxianwei520/react", "reduxjs/redux", or any result that contains "react" but is not the exact org/repo name). If the correct link is not visible, SCROLL to find it or return task_status "failed" with reasoning that the exact link was not found.
 - If the session history already shows "Clicked badge N" and the objective is still not achieved (e.g. wrong link was clicked), do NOT return the same target_id again. Choose a different badge that exactly matches the objective link text, or return task_status "failed" with reasoning.
+
+RE-SEARCH LOOP (CRITICAL): If the Action History shows that you already performed a search (e.g. typed a query into a search bar) and then clicked a search result, and the current page is not the target (e.g. you landed on a different repo or topic page), you MUST NOT click the search bar again and type the same query. That causes an infinite loop. Instead: (1) SCROLL the current page to find a link whose visible text exactly matches the objective (e.g. facebook/react), or (2) return task_status "failed" with reasoning that the correct link was not found after the previous click. Do not re-trigger search.
 
 CODE EDITOR + RUN (e.g. W3Schools Tryit): When the objective is to edit code and click Run, the result of Run appears in the main preview/result pane (the rendered output of the edited document). If the page has an iframe with its own src (e.g. demo_iframe.htm), that iframe content does NOT change when you edit the main code — and that is expected. Do NOT return "failed" with "changes won't appear inside the iframe". Instead, add the requested HTML in the editable code (e.g. inside <body>), click Run, then confirm the new content appears in the main result area (outside the iframe). Set "completed" when you see that content in the preview.
 
@@ -167,8 +183,10 @@ STRICT RULE: Return only valid JSON. No prose, no markdown, no code fences.`;
 // Public types
 // ---------------------------------------------------------------------------
 
-/** What Gemini returns — a badge ID, task_status, and action details */
+/** What Gemini returns — scene analysis, badge ID, task_status, and action details */
 export interface GeminiVerdict {
+  /** Brief analysis of the current visual state (dropdowns, modals, errors). */
+  scene_understanding: string;
   target_id: number;
   action_type: string;
   /** When action_type is "scroll", must be "up" or "down". */
@@ -188,6 +206,8 @@ export interface AnalyzeOptions {
   objective: string;
   /** Ordered list of actions already taken this session */
   history?: string[];
+  /** Badge ID → visible text (up to 30 chars) for DOM Element Map in prompt */
+  domTextMap?: Record<number, string>;
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +216,7 @@ export interface AnalyzeOptions {
 export async function analyzeMarkedScreenshot(
   opts: AnalyzeOptions,
 ): Promise<GeminiVerdict> {
-  const { imageBase64, objective, history } = opts;
+  const { imageBase64, objective, history, domTextMap } = opts;
 
   // Build the history block injected at the top of the user turn.
   // Placed BEFORE the image so the model reads context first.
@@ -213,6 +233,7 @@ export async function analyzeMarkedScreenshot(
       : null;
 
   const safeFailure = (reason: string): GeminiVerdict => ({
+    scene_understanding: "",
     target_id: -1,
     action_type: "none",
     input_text: "",
@@ -222,6 +243,13 @@ export async function analyzeMarkedScreenshot(
     confidence_score: 0,
   });
 
+  const domMapBlock =
+    domTextMap && Object.keys(domTextMap).length > 0
+      ? `DOM Element Map (verify badge text before clicking):\n${Object.entries(domTextMap)
+          .map(([id, text]) => `  ${id}: "${text.replace(/"/g, '\\"')}"`)
+          .join("\n")}\n`
+      : "";
+
   try {
     const response = await getClient().models.generateContent({
       model: MODEL,
@@ -230,6 +258,7 @@ export async function analyzeMarkedScreenshot(
           role: "user",
           parts: [
             ...(historyBlock ? [{ text: historyBlock }] : []),
+            ...(domMapBlock ? [{ text: domMapBlock }] : []),
             { inlineData: { mimeType: "image/png", data: imageBase64 } },
             { text: `OBJECTIVE: ${objective}` },
           ],
@@ -285,6 +314,7 @@ export async function analyzeMarkedScreenshot(
 // Truncation repair — Gemini sometimes returns cut-off JSON
 // ---------------------------------------------------------------------------
 const REQUIRED_KEYS = [
+  "scene_understanding",
   "target_id",
   "action_type",
   "input_text",
@@ -295,6 +325,7 @@ const REQUIRED_KEYS = [
 ] as const;
 
 const DEFAULTS: Record<string, unknown> = {
+  scene_understanding: "",
   target_id: -1,
   action_type: "none",
   input_text: "",
@@ -338,6 +369,7 @@ function validateVerdict(raw: unknown): GeminiVerdict {
   const obj = raw as Record<string, unknown>;
 
   const required: (keyof GeminiVerdict)[] = [
+    "scene_understanding",
     "target_id",
     "action_type",
     "input_text",
@@ -349,6 +381,8 @@ function validateVerdict(raw: unknown): GeminiVerdict {
   for (const f of required) {
     if (!(f in obj)) throw new Error(`[agent] Missing field: "${f}"`);
   }
+  if (typeof obj["scene_understanding"] !== "string")
+    throw new Error("[agent] scene_understanding must be a string");
   if (typeof obj["target_id"] !== "number")
     throw new Error("[agent] target_id must be a number");
   if (typeof obj["action_type"] !== "string")

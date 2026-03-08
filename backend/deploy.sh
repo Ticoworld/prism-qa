@@ -3,11 +3,28 @@
 # Run from the backend/ directory.
 # Requires: gcloud CLI authenticated + billing-enabled project set.
 #
-# Set GOOGLE_GENAI_API_KEY in Cloud Run (Console → Edit → Variables) if not already set.
-#
+# Loads .env from this directory if present (GOOGLE_GENAI_API_KEY, WS_SECRET_TOKEN).
 # Usage:   bash deploy.sh
 # ---------------------------------------------------------------------------
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+# Load .env so GOOGLE_GENAI_API_KEY and WS_SECRET_TOKEN are available for Cloud Run
+if [ -f .env ]; then
+  set -a
+  # shellcheck source=/dev/null
+  source .env
+  set +a
+fi
+
+: "${WS_SECRET_TOKEN:=prism_secure_hackathon_token_2026}"
+
+if [ -z "${GOOGLE_GENAI_API_KEY:-}" ]; then
+  echo "  ERROR: GOOGLE_GENAI_API_KEY is not set. Add it to backend/.env or export it before running deploy.sh"
+  exit 1
+fi
 
 PROJECT_ID=$(gcloud config get-value project 2>/dev/null)
 echo ""
@@ -24,7 +41,7 @@ gcloud run deploy prism-qa-backend \
   --session-affinity \
   --memory 2Gi \
   --allow-unauthenticated \
-  --set-env-vars "WS_SECRET_TOKEN=prism_secure_hackathon_token_2026"
+  --set-env-vars "WS_SECRET_TOKEN=${WS_SECRET_TOKEN},GOOGLE_GENAI_API_KEY=${GOOGLE_GENAI_API_KEY}"
 
 echo ""
 echo "  Deployment complete."

@@ -230,7 +230,7 @@ export default function PrismQA() {
     const SETTLE_DELAY = 2000;  // ms after action for UI animations to settle
 
     setTimeout(() => {
-      const execs = ['click', 'type', 'navigate', 'scroll'];
+      const execs = ['click', 'type', 'navigate', 'scroll', 'press_escape'];
       if (execs.includes(a.action_type)) sendAction(a);
 
       // After the action, wait for the page to settle, then loop
