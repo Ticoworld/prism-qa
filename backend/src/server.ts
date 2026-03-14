@@ -23,6 +23,26 @@ const DEFAULT_URL = process.env["DEFAULT_URL"] ?? "http://localhost:3002";
 const SCREENSHOT_TIMEOUT_MS = 25_000;
 
 // ---------------------------------------------------------------------------
+// URL validation — only http/https allowed (SSRF hardening)
+// ---------------------------------------------------------------------------
+function validateTargetUrl(url: string): { ok: true; url: string } | { ok: false; error: string } {
+  const trimmed = url.trim();
+  if (!trimmed) return { ok: false, error: "URL is required." };
+  try {
+    const u = new URL(trimmed);
+    if (u.protocol !== "http:" && u.protocol !== "https:") {
+      return {
+        ok: false,
+        error: `Unsupported URL scheme: ${u.protocol} Only http and https are allowed.`,
+      };
+    }
+    return { ok: true, url: trimmed };
+  } catch {
+    return { ok: false, error: "Invalid URL." };
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Message protocol — inbound from frontend
 // ---------------------------------------------------------------------------
 interface CaptureMessage {
@@ -1048,8 +1068,16 @@ async function handleAction(
       break;
     }
     case "navigate": {
+      const navUrlCheck = validateTargetUrl(msg.url);
+      if (!navUrlCheck.ok) {
+        if (socket) {
+          send(socket, { type: "error", message: navUrlCheck.error, code: "INVALID_URL" });
+          return;
+        }
+        throw new Error(navUrlCheck.error);
+      }
       try {
-        await session.page.goto(msg.url, {
+        await session.page.goto(navUrlCheck.url, {
           waitUntil: "domcontentloaded",
           timeout: 45_000,
         });
@@ -1150,6 +1178,12 @@ app.post("/api/run-test", async (req: Request, res: Response) => {
       });
       return;
     }
+    const urlCheck = validateTargetUrl(url);
+    if (!urlCheck.ok) {
+      res.status(400).json({ error: urlCheck.error, code: "BAD_REQUEST" });
+      return;
+    }
+    url = urlCheck.url;
   } catch {
     res.status(400).json({ error: "Invalid JSON body", code: "BAD_REQUEST" });
     return;
@@ -1247,8 +1281,12 @@ wss.on("connection", (socket: WebSocket, req: http.IncomingMessage) => {
     try {
       if (msg.type === "init") {
         // Navigate the browser to the user-supplied URL, then confirm ready.
-        // Use domcontentloaded so sticky headers/ads don't block; heavy sites often never "load".
-        const targetUrl = msg.url.trim();
+        const urlCheck = validateTargetUrl(msg.url);
+        if (!urlCheck.ok) {
+          send(socket, { type: "error", message: urlCheck.error, code: "INVALID_URL" });
+          return;
+        }
+        const targetUrl = urlCheck.url;
         console.log(`[ws] Received init. Navigating to ${targetUrl}...`);
         try {
           await session.page.goto(targetUrl, {
@@ -1351,6 +1389,17 @@ process.on("SIGTERM", () => void shutdown("SIGTERM"));
 // Boot
 // ---------------------------------------------------------------------------
 async function main(): Promise<void> {
+  // ── 0. Validate required env so the app fails fast with a clear message ──
+  const requiredEnv = ["GOOGLE_GENAI_API_KEY", "WS_SECRET_TOKEN"] as const;
+  for (const key of requiredEnv) {
+    if (!process.env[key]?.trim()) {
+      console.error(
+        `[server] Missing required env: ${key}. Set it in backend/.env or the environment.`,
+      );
+      process.exit(1);
+    }
+  }
+
   // ── 1. Bind the port FIRST so Cloud Run health check passes immediately ──
   await new Promise<void>((resolve) => {
     httpServer.listen(PORT, "0.0.0.0", () => {

@@ -19,10 +19,13 @@ if [ -f .env ]; then
   set +a
 fi
 
-: "${WS_SECRET_TOKEN:=prism_secure_hackathon_token_2026}"
-
 if [ -z "${GOOGLE_GENAI_API_KEY:-}" ]; then
   echo "  ERROR: GOOGLE_GENAI_API_KEY is not set. Add it to backend/.env or export it before running deploy.sh"
+  exit 1
+fi
+
+if [ -z "${WS_SECRET_TOKEN:-}" ]; then
+  echo "  ERROR: WS_SECRET_TOKEN is not set. Add it to backend/.env or export it before running deploy.sh"
   exit 1
 fi
 
